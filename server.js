@@ -14,7 +14,7 @@ if (!isMainThread) {
 }
 
 const app = express();
-const PORT = 5000;
+const PORT = process.env.PORT || 5000;
 const API_URL_HU = 'https://luck8bot.com/api/GetNewLottery/Taixiu';
 const API_URL_MD5 = 'https://luck8bot.com/api/GetNewLottery/TaixiuMd5';
 
@@ -178,7 +178,8 @@ function executeLogicAnalysis(data, type, learningStats, patternWeights) {
 
   const cauBeCau = (() => {
     if (results.length < 8) return { detected: false };
-    if (cauBet.detected && sLen >= 4) {
+    let sLen = 1; for (let i = 1; i < results.length; i++) { if (results[i] === results[0]) sLen++; else break; }
+    if (sLen >= 4) {
       let prvLen = 1; const bfr = results.slice(sLen);
       for (let i = 1; i < bfr.length; i++) { if (bfr[i] === bfr[0]) prvLen++; else break; }
       if (prvLen >= 3 && bfr[0] !== results[0]) return { detected: true, prediction: results[0] === 'Tài' ? 'Xỉu' : 'Tài', confidence: Math.round(11 * getWeight('cau_be_cau')), name: 'Cầu Bẻ Cầu' };
@@ -335,7 +336,110 @@ function loadLearningData() {
   } catch (e) { console.error('Error loading learning data:', e.message); }
 }
 
-... (giữ nguyên toàn bộ logic trung gian ở đây) ...
+function saveLearningData() {
+  try { fs.writeFileSync(LEARNING_FILE, JSON.stringify(learningData, null, 2)); } catch (e) { console.error('Error saving learning data:', e.message); }
+}
+
+function loadPredictionHistory() {
+  try {
+    if (fs.existsSync(HISTORY_FILE)) {
+      const parsed = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'));
+      predictionHistory = parsed.history || { hu: [], md5: [] };
+      lastProcessedPhien = parsed.lastProcessedPhien || { hu: null, md5: null };
+    }
+  } catch (e) { console.error('Error loading history:', e.message); }
+}
+
+function savePredictionHistory() {
+  try { fs.writeFileSync(HISTORY_FILE, JSON.stringify({ history: predictionHistory, lastProcessedPhien, lastSaved: new Date().toISOString() }, null, 2)); } catch (e) { console.error('Error saving history:', e.message); }
+}
+
+function transformApiData(apiData) {
+  if (!apiData || apiData.state !== 1 || !apiData.data) return null;
+  const item = apiData.data;
+  const parts = item.OpenCode.split(',').map(num => parseInt(num.trim()));
+  if (parts.length !== 3) return null;
+  const tong = parts[0] + parts[1] + parts[2];
+  return [{ Phien: parseInt(item.Expect), Ket_qua: tong >= 11 ? 'Tài' : 'Xỉu', Xuc_xac_1: parts[0], Xuc_xac_2: parts[1], Xuc_xac_3: parts[2], Tong: tong }];
+}
+
+async function fetchData(url, cacheKey) {
+  try {
+    const response = await axios.get(url);
+    const transformed = transformApiData(response.data);
+    if (transformed && transformed.length > 0) {
+      const idx = historicalDataCache[cacheKey].findIndex(item => item.Phien === transformed[0].Phien);
+      if (idx === -1) {
+        historicalDataCache[cacheKey].unshift(transformed[0]);
+        if (historicalDataCache[cacheKey].length > 60) historicalDataCache[cacheKey] = historicalDataCache[cacheKey].slice(0, 60);
+      }
+    }
+    return historicalDataCache[cacheKey];
+  } catch (error) {
+    console.error(`Error fetching ${cacheKey} data:`, error.message);
+    return historicalDataCache[cacheKey];
+  }
+}
+
+function getPatternIdFromName(name) {
+  const mapping = { 'Cầu Bệt': 'cau_bet', 'Cầu Đảo 1-1': 'cau_dao_11', 'Cầu 2-2': 'cau_22', 'Cầu 3-3': 'cau_33', 'Cầu 4-4': 'cau_44', 'Cầu 5-5': 'cau_55', 'Cầu 1-2-1': 'cau_121', 'Cầu 1-2-3': 'cau_123', 'Cầu 3-2-1': 'cau_321', 'Cầu Nhảy Cóc': 'cau_nhay_coc', 'Cầu Nhịp Nghiêng': 'cau_nhip_nghieng', 'Cầu 3 Ván 1': 'cau_3van1', 'Cầu Bẻ Cầu': 'cau_be_cau', 'Cầu Ziczac': 'cau_ziczac', 'Cầu Rồng': 'cau_rong', 'Biểu Đồ Đường': 'dice_trend_line', 'Dây Gãy': 'day_gay' };
+  for (const [key, value] of Object.entries(mapping)) { if (name.includes(key)) return value; }
+  return 'cau_tu_nhien';
+}
+
+function updateStatsAndWeights(type, patternId, isCorrect) {
+  if (!learningData[type].patternWeights) learningData[type].patternWeights = { ...DEFAULT_PATTERN_WEIGHTS };
+  if (!learningData[type].patternStats[patternId]) {
+    learningData[type].patternStats[patternId] = { total: 0, correct: 0, accuracy: 0.5, recentResults: [] };
+  }
+  const s = learningData[type].patternStats[patternId];
+  s.total++; if (isCorrect) s.correct++;
+  s.recentResults.push(isCorrect ? 1 : 0); if (s.recentResults.length > 20) s.recentResults.shift();
+  s.accuracy = s.correct / s.total;
+  
+  let oldW = learningData[type].patternWeights[patternId] || 1.0;
+  if (s.recentResults.length >= 5) {
+    const recentAcc = s.recentResults.reduce((a, b) => a + b, 0) / s.recentResults.length;
+    if (recentAcc > 0.6) learningData[type].patternWeights[patternId] = Math.min(2.0, oldW * 1.05);
+    else if (recentAcc < 0.4) learningData[type].patternWeights[patternId] = Math.max(0.3, oldW * 0.95);
+  }
+}
+
+async function verifyPredictions(type, currentData) {
+  let updated = false;
+  for (const pred of learningData[type].predictions) {
+    if (pred.verified) continue;
+    const actualResult = currentData.find(d => d.Phien.toString() === pred.phien);
+    if (actualResult) {
+      pred.verified = true; pred.actual = actualResult.Ket_qua;
+      pred.isCorrect = (pred.prediction === 'Tài' || pred.prediction === 'tai' ? 'Tài' : 'Xỉu') === actualResult.Ket_qua;
+      
+      if (pred.isCorrect) {
+        learningData[type].correctPredictions++;
+        learningData[type].streakAnalysis.wins++;
+        learningData[type].streakAnalysis.currentStreak = Math.max(1, learningData[type].streakAnalysis.currentStreak + 1);
+        learningData[type].streakAnalysis.bestStreak = Math.max(learningData[type].streakAnalysis.bestStreak, learningData[type].streakAnalysis.currentStreak);
+      } else {
+        learningData[type].streakAnalysis.losses++;
+        learningData[type].streakAnalysis.currentStreak = Math.min(-1, learningData[type].streakAnalysis.currentStreak - 1);
+        learningData[type].streakAnalysis.worstStreak = Math.min(learningData[type].streakAnalysis.worstStreak, learningData[type].streakAnalysis.currentStreak);
+      }
+      learningData[type].recentAccuracy.push(pred.isCorrect ? 1 : 0);
+      if (learningData[type].recentAccuracy.length > 50) learningData[type].recentAccuracy.shift();
+      
+      if (pred.patterns) {
+        pred.patterns.forEach(pName => {
+          const pId = getPatternIdFromName(pName);
+          updateStatsAndWeights(type, pId, pred.isCorrect);
+        });
+      }
+      updated = true;
+    }
+  }
+  if (updated) { learningData[type].lastUpdate = new Date().toISOString(); saveLearningData(); }
+}
+
+function normalizeResult(res) { return (res === 'Tài' || res === 'tài') ? 'tai' : 'xiu'; }
 
 // ==================== HÀM XỬ LÝ ĐA LUỒNG CORE CHÍNH ====================
 async function processPredictionForType(type, url) {
@@ -348,7 +452,6 @@ async function processPredictionForType(type, url) {
   const workerResult = await runAnalysisWorker(data, type);
   
   if (lastProcessedPhien[type] !== nextPhien) {
-    // THAY ĐỔI: ID ĐÃ ĐƯỢC CẬP NHẬT THÀNH @tranhoang2286
     const record = { phien_hien_tai: nextPhien.toString(), du_doan: normalizeResult(workerResult.prediction), ti_le: `${workerResult.confidence}%`, id: '@tranhoang2286', timestamp: new Date().toISOString() };
     predictionHistory[type].unshift(record);
     if (predictionHistory[type].length > MAX_HISTORY) predictionHistory[type] = predictionHistory[type].slice(0, MAX_HISTORY);
@@ -360,7 +463,6 @@ async function processPredictionForType(type, url) {
     lastProcessedPhien[type] = nextPhien;
   }
   
-  // THAY ĐỔI: ID ĐÃ ĐƯỢC CẬP NHẬT THÀNH @tranhoang2286
   return { phien_hien_tai: nextPhien.toString(), du_doan: normalizeResult(workerResult.prediction), ti_le: `${workerResult.confidence}%`, id: '@tranhoang2286', factors: workerResult.factors };
 }
 
@@ -386,4 +488,25 @@ app.get('/luck8-md5', async (req, res) => {
   res.json({ phien_hien_tai: result.phien_hien_tai, du_doan: result.du_doan, ti_le: result.ti_le, id: result.id });
 });
 
-... (giữ nguyên toàn bộ phần khởi chạy server bên dưới) ...
+app.get('/luck8-hu/lichsu', (req, res) => res.json({ type: 'Luck8 - Tài Xỉu Hũ', history: predictionHistory.hu, total: predictionHistory.hu.length }));
+app.get('/luck8-md5/lichsu', (req, res) => res.json({ type: 'Luck8 - Tài Xỉu MD5', history: predictionHistory.md5, total: predictionHistory.md5.length }));
+
+app.get('/reset-learning', (req, res) => {
+  learningData = {
+    hu: { predictions: [], patternStats: {}, totalPredictions: 0, correctPredictions: 0, patternWeights: { ...DEFAULT_PATTERN_WEIGHTS }, lastUpdate: null, streakAnalysis: { wins: 0, losses: 0, currentStreak: 0, bestStreak: 0, worstStreak: 0 }, adaptiveThresholds: {}, recentAccuracy: [] },
+    md5: { predictions: [], patternStats: {}, totalPredictions: 0, correctPredictions: 0, patternWeights: { ...DEFAULT_PATTERN_WEIGHTS }, lastUpdate: null, streakAnalysis: { wins: 0, losses: 0, currentStreak: 0, bestStreak: 0, worstStreak: 0 }, adaptiveThresholds: {}, recentAccuracy: [] }
+  };
+  saveLearningData();
+  res.json({ message: 'Learning data reset successfully' });
+});
+
+// Khởi chạy máy chủ API chính
+loadLearningData();
+loadPredictionHistory();
+
+app.listen(PORT, '0.0.0.0', async () => {
+  console.log(`[Multi-threaded Server Main] Running on port ${PORT}`);
+  await fetchData(API_URL_HU, 'hu');
+  await fetchData(API_URL_MD5, 'md5');
+  setInterval(autoProcessPredictions, AUTO_SAVE_INTERVAL);
+});
