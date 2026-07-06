@@ -1,0 +1,24 @@
+{
+  "name": "luck8-prediction-api",
+  "version": "1.0.0",
+  "description": "Luck8 - Advanced Tai Xiu Prediction API",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "express",
+    "axios",
+    "prediction",
+    "bot"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.7.9",
+    "express": "^4.21.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
